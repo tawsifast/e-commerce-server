@@ -1,17 +1,10 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { rateLimit } from "express-rate-limit";
 import Stripe from "stripe";
-import { SignJWT, jwtVerify } from "jose-cjs";
-import {
-  MongoClient,
-  ObjectId,
-  ServerApiVersion,
-  type Collection,
-  type Db,
-  type Filter,
-  type WithId,
-} from "mongodb";
+import { z } from "zod";
+import {MongoClient,ObjectId,ServerApiVersion,type Collection,type Db,type Filter,type WithId} from "mongodb";
 
 dotenv.config();
 
@@ -20,17 +13,32 @@ const PORT = Number(process.env.PORT) || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || "";
 const DB_NAME = process.env.MONGODB_DB || "my-shop";
 
-const AUTH_SECRET = new TextEncoder().encode(process.env.BETTER_AUTH_SECRET || "");
 const SESSION_COOKIE = process.env.BETTER_AUTH_COOKIE || "better-auth.session_token";
-const API_TOKEN_COOKIE = process.env.API_TOKEN_COOKIE || "marketa_api_token";
-const JWT_TTL_SECONDS = Number(process.env.JWT_TTL_SECONDS) || 3600;
 
-// Stripe is optional — without STRIPE_SECRET_KEY confirm falls back to
-// marking orders paid without verification so the app still works keyless.
+// Stripe is optional. Without STRIPE_SECRET_KEY, order confirmation requires
+// ALLOW_DEV_PAYMENT_FALLBACK=true to mark orders paid without verification.
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const ALLOW_DEV_PAYMENT_FALLBACK = process.env.ALLOW_DEV_PAYMENT_FALLBACK === "true";
+
+const ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled", "refunded"] as const;
+const ROLES = ["buyer", "seller", "admin"] as const;
 
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
 app.use(express.json());
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(globalLimiter);
 
 const client = new MongoClient(MONGODB_URI, {
   serverApi: {
@@ -104,8 +112,11 @@ interface OrderDoc {
   status: string;
   orderStatus: string;
   paymentStatus: string;
+  paymentIntentId?: string;
   createdAt: Date;
   address: { line1?: string; city?: string; state?: string; zip?: string; country?: string };
+  contact?: string;
+  notes?: string;
 }
 
 interface WishlistDoc {
@@ -114,15 +125,62 @@ interface WishlistDoc {
   productIds: string[];
 }
 
-interface ProductPayload {
-  title: string;
-  description?: string;
-  price: number;
-  discountPrice?: number;
-  category?: string;
-  stock: number;
-  images: string[];
-}
+// ------------------------------------------------------------
+// Validation
+// ------------------------------------------------------------
+
+const idSchema = z.string().min(1).max(64);
+
+const productObjectSchema = z.object({
+  title: z.string().trim().min(1, "Title is required").max(200),
+  description: z.string().max(5000).optional(),
+  price: z.coerce.number().min(0, "Price must be >= 0").max(1_000_000),
+  discountPrice: z.coerce.number().min(0).max(1_000_000).nullable().optional(),
+  category: z.string().trim().max(100).optional(),
+  stock: z.coerce.number().int().min(0, "Stock must be >= 0").max(1_000_000),
+  images: z.array(z.string().trim().max(2000)).max(10).optional(),
+});
+
+const productSchema = productObjectSchema.refine((d) => d.discountPrice == null || d.discountPrice <= d.price, {
+  message: "discountPrice must not exceed price",
+  path: ["discountPrice"],
+});
+
+const productPatchSchema = productObjectSchema.partial().refine(
+  (d) => d.price == null || d.discountPrice == null || d.discountPrice <= d.price,
+  { message: "discountPrice must not exceed price", path: ["discountPrice"] },
+);
+
+const checkoutSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        product: z.string().min(1),
+        quantity: z.coerce.number().int().min(1, "Quantity must be >= 1"),
+      }),
+    )
+    .min(1, "Cart is empty")
+    .max(100),
+  address: z
+    .object({
+      line1: z.string().max(200).optional(),
+      city: z.string().max(100).optional(),
+      state: z.string().max(100).optional(),
+      zip: z.string().max(40).optional(),
+      country: z.string().max(100).optional(),
+    })
+    .optional(),
+  contact: z.string().max(100).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+const reviewSchema = z.object({
+  rating: z.coerce.number().int().min(1).max(5),
+  comment: z.string().trim().max(1000, "Review is too long"),
+});
+
+const statusSchema = z.enum(ORDER_STATUSES);
+const roleSchema = z.enum(ROLES);
 
 const products = (): Collection<ProductDoc> => db.collection<ProductDoc>("products");
 const reviews = (): Collection<ReviewDoc> => db.collection<ReviewDoc>("reviews");
@@ -170,6 +228,8 @@ function toOrder(o: WithId<OrderDoc>) {
     paymentStatus: o.paymentStatus,
     createdAt: iso(o.createdAt),
     address: o.address,
+    contact: o.contact,
+    notes: o.notes,
   };
 }
 
@@ -216,11 +276,21 @@ async function paginate<T>(items: T[], page: number, limit: number) {
 function pageOf(req: Request, fallbackLimit = 12) {
   const page = Number(req.query.page) >= 1 ? Number(req.query.page) : 1;
   const limit = Number(req.query.limit) >= 1 ? Number(req.query.limit) : fallbackLimit;
-  return { page, limit };
+  return { page, limit: Math.min(limit, 100) };
+}
+
+// dir=-1 on confirmed payment (stock down, sold up); dir=1 on cancel (restore).
+async function adjustStock(order: { items: OrderItemDoc[] }, dir: -1 | 1) {
+  for (const item of order.items) {
+    const oid = toOid(item.productId);
+    if (!oid) continue;
+    await products().updateOne({ _id: oid }, { $inc: { stock: dir * item.quantity, sold: -dir * item.quantity } });
+  }
 }
 
 // ------------------------------------------------------------
-// Auth — JWT API tokens (verified with jose-cjs)
+// Auth — validates the better-auth session cookie directly against
+// the shared Mongo `session` collection (no custom JWT).
 // ------------------------------------------------------------
 
 interface SessionDoc {
@@ -229,12 +299,6 @@ interface SessionDoc {
   expiresAt: string;
   userId: ObjectId;
   createdAt?: string;
-}
-
-interface JwtPayload {
-  sub: string;
-  name: string;
-  role: string;
 }
 
 const sessions = (): Collection<SessionDoc> => db.collection<SessionDoc>("session");
@@ -250,28 +314,24 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
-async function signApiToken(user: WithId<MongoUser>): Promise<string> {
-  return new SignJWT({ name: user.name, role: user.role ?? "buyer" })
-    .setProtectedHeader({ alg: "HS256" })
-    .setSubject(user._id.toString())
-    .setIssuedAt()
-    .setExpirationTime(Math.floor(Date.now() / 1000) + JWT_TTL_SECONDS)
-    .sign(AUTH_SECRET);
-}
-
-// Verifies the API JWT cookie (cached per request), then reloads the user
-// from Mongo so role/blocked changes apply immediately.
+// Authenticates the current request by looking up the better-auth session
+// (cached per request), then reloads the user from Mongo so role/blocked
+// changes apply immediately. better-auth stores the raw token in the DB but
+// the cookie carries "<token>.<hash>" — only the part before the first dot
+// is the session id.
 async function apiUser(req: Request, res: Response): Promise<WithId<MongoUser> | null> {
   if (res.locals.__apiUserChecked) return res.locals.__apiUser ?? null;
   res.locals.__apiUserChecked = true;
   res.locals.__apiUser = null;
 
-  const token = parseCookies(req.headers.cookie)[API_TOKEN_COOKIE];
+  const cookieValue = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  const token = cookieValue ? cookieValue.split(".")[0] : "";
   if (!token) return null;
 
   try {
-    const { payload } = await jwtVerify(token, AUTH_SECRET, { algorithms: ["HS256"] });
-    const user = await users().findOne({ _id: new ObjectId(payload.sub as string) });
+    const session = await sessions().findOne({ token });
+    if (!session || new Date(session.expiresAt) <= new Date()) return null;
+    const user = await users().findOne({ _id: session.userId });
     if (!user || user.blocked) return null;
     res.locals.__apiUser = user;
     return user;
@@ -279,44 +339,6 @@ async function apiUser(req: Request, res: Response): Promise<WithId<MongoUser> |
     return null;
   }
 }
-
-// Exchange the better-auth session cookie for an API JWT cookie.
-app.post(
-  "/api/auth/token",
-  ah(async (req, res) => {
-    // better-auth stores the raw token in the DB but the cookie carries
-    // "<token>.<hash>" — only the part before the first dot is the session id.
-    const cookieValue = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-    const token = cookieValue ? cookieValue.split(".")[0] : "";
-    if (!token) return res.status(401).json({ message: "Not authenticated" });
-
-    const session = await sessions().findOne({ token });
-    if (!session || new Date(session.expiresAt) <= new Date()) {
-      return res.status(401).json({ message: "Session expired" });
-    }
-
-    const user = await users().findOne({ _id: session.userId });
-    if (!user || user.blocked) return res.status(401).json({ message: "Not authenticated" });
-
-    const apiToken = await signApiToken(user);
-    res.cookie(API_TOKEN_COOKIE, apiToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: false,
-      maxAge: JWT_TTL_SECONDS * 1000,
-      path: "/",
-    });
-    res.json({ user: toPublicUser(user) });
-  }),
-);
-
-app.post(
-  "/api/auth/logout",
-  ah(async (_req, res) => {
-    res.clearCookie(API_TOKEN_COOKIE, { httpOnly: true, sameSite: "lax", path: "/" });
-    res.json({ success: true });
-  }),
-);
 
 function requireRoles(...roles: string[]) {
   return ah(async (req, res, next) => {
@@ -368,17 +390,19 @@ app.get(
         items = [...items].sort((a, b) => priceOf(b) - priceOf(a));
         break;
       case "rating": {
-        const ratingMap = new Map<string, number>();
+        const sums = new Map<string, number>();
+        const counts = new Map<string, number>();
         const grouped = await reviews()
           .find({ productId: { $in: items.map((p) => p._id.toString()) } })
           .toArray();
         for (const r of grouped) {
-          ratingMap.set(r.productId, (ratingMap.get(r.productId) ?? 0) + r.rating);
+          sums.set(r.productId, (sums.get(r.productId) ?? 0) + r.rating);
+          counts.set(r.productId, (counts.get(r.productId) ?? 0) + 1);
         }
         items = [...items].sort((a, b) => {
-          const ra = ratingMap.get(a._id.toString()) ?? 0;
-          const rb = ratingMap.get(b._id.toString()) ?? 0;
-          return rb - ra;
+          const avgA = (sums.get(a._id.toString()) ?? 0) / (counts.get(a._id.toString()) ?? 1);
+          const avgB = (sums.get(b._id.toString()) ?? 0) / (counts.get(b._id.toString()) ?? 1);
+          return avgB - avgA || (counts.get(b._id.toString()) ?? 0) - (counts.get(a._id.toString()) ?? 0);
         });
         break;
       }
@@ -436,7 +460,7 @@ app.get(
   "/api/products/:id",
   ah(async (req, res) => {
     const oid = toOid(req.params.id);
-    const product = oid ? await products().findOne({ _id: oid }) : null;
+    const product = oid ? await products().findOne({ _id: oid, hidden: { $ne: true } }) : null;
     if (!product) return res.status(404).json({ message: "Product not found" });
     res.json({ product: await enrichProduct(product) });
   }),
@@ -458,19 +482,38 @@ app.post(
   ah(async (req, res) => {
     const user = await apiUser(req, res);
     if (!user) return res.status(401).json({ message: "Not authenticated" });
-    const oid = toOid(req.params.id);
+    const productId = req.params.id;
+    const oid = toOid(productId);
     const product = oid ? await products().findOne({ _id: oid }) : null;
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    const body = (req.body ?? {}) as { rating?: unknown; comment?: unknown };
+    const parsed = reviewSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: parsed.error.issues[0]?.message ?? "Invalid review" });
+    }
+
+    const userId = user._id.toString();
+    const bought = await orders().findOne({
+      "buyer._id": userId,
+      items: { $elemMatch: { productId } },
+      status: { $ne: "cancelled" },
+    });
+    if (!bought) {
+      return res.status(403).json({ message: "Only verified buyers can review this product" });
+    }
+    const existing = await reviews().findOne({ productId, userId });
+    if (existing) {
+      return res.status(400).json({ message: "You already reviewed this product" });
+    }
+
     const review: ReviewDoc = {
       _id: new ObjectId(),
-      productId: req.params.id,
-      userId: user._id.toString(),
-      rating: Math.min(5, Math.max(1, Number(body.rating) || 1)),
-      comment: String(body.comment ?? "").trim(),
+      productId,
+      userId,
+      rating: parsed.data.rating,
+      comment: parsed.data.comment,
       createdAt: new Date(),
-      user: { _id: user._id.toString(), name: user.name, photo: user.image ?? user.photo },
+      user: { _id: userId, name: user.name, photo: user.image ?? user.photo },
     };
     await reviews().insertOne(review);
     res.json({ review: toReview(review) });
@@ -488,7 +531,9 @@ app.get(
     if (!user) return res.status(401).json({ message: "Not authenticated" });
     const doc = await wishlists().findOne({ userId: user._id.toString() });
     const ids = (doc?.productIds ?? []).map(toOid).filter((x): x is ObjectId => x !== null);
-    const docs = ids.length ? await products().find({ _id: { $in: ids } }).toArray() : [];
+    const docs = ids.length
+      ? await products().find({ _id: { $in: ids }, hidden: { $ne: true } }).toArray()
+      : [];
     const items = [];
     for (const p of docs) items.push(await enrichProduct(p));
     res.json({ items });
@@ -502,6 +547,9 @@ app.post(
     if (!user) return res.status(401).json({ message: "Not authenticated" });
     const productId = String((req.body ?? {}).productId ?? "");
     if (!productId) return res.status(400).json({ message: "productId is required" });
+    const oid = toOid(productId);
+    const product = oid ? await products().findOne({ _id: oid }) : null;
+    if (!product) return res.status(400).json({ message: "Product not found" });
     const userId = user._id.toString();
     await wishlists().updateOne(
       { userId },
@@ -531,30 +579,35 @@ app.delete(
 
 app.post(
   "/api/orders/checkout",
+  strictLimiter,
   ah(async (req, res) => {
     const user = await apiUser(req, res);
     if (!user) return res.status(401).json({ message: "Not authenticated" });
 
-    const body = (req.body ?? {}) as {
-      items?: { product?: string; quantity?: number }[];
-      address?: { line1?: string; city?: string; state?: string; zip?: string; country?: string };
-      contact?: string;
-      notes?: string;
-    };
+    const parsed = checkoutSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: parsed.error.issues[0]?.message ?? "Invalid checkout payload" });
+    }
+    const { items: bodyItems, address, contact, notes } = parsed.data;
 
     const items: OrderItemDoc[] = [];
-    for (const it of body.items ?? []) {
+    for (const it of bodyItems) {
       const oid = toOid(it.product);
-      const product = oid ? await products().findOne({ _id: oid }) : null;
+      const product = oid ? await products().findOne({ _id: oid, hidden: { $ne: true } }) : null;
+      if (!product) {
+        return res.status(400).json({ message: `Product no longer available: ${it.product}` });
+      }
+      if (it.quantity > product.stock) {
+        return res.status(400).json({ message: `Only ${product.stock} left in stock for "${product.title}"` });
+      }
+      const price = product.discountPrice ?? product.price;
       items.push({
-        productId: it.product ?? "",
-        title: product?.title ?? "Product",
-        image: product?.images?.[0],
-        price: product ? (product.discountPrice ?? product.price) : 0,
-        quantity: Number(it.quantity) || 1,
-        seller: product
-          ? { _id: product.sellerId, name: product.sellerName }
-          : { _id: "unknown", name: "Marketa" },
+        productId: it.product,
+        title: product.title,
+        image: product.images?.[0],
+        price,
+        quantity: it.quantity,
+        seller: { _id: product.sellerId, name: product.sellerName },
       });
     }
 
@@ -570,17 +623,28 @@ app.post(
       paymentStatus: "pending",
       createdAt: new Date(),
       address: {
-        line1: body.address?.line1 ?? "123 Main St",
-        city: body.address?.city ?? "Portland",
-        country: body.address?.country ?? "United States",
+        line1: address?.line1 ?? "123 Main St",
+        city: address?.city ?? "Portland",
+        state: address?.state,
+        zip: address?.zip,
+        country: address?.country ?? "United States",
       },
+      contact,
+      notes,
     };
     await orders().insertOne(order);
 
     // The client creates a Stripe Checkout Session (Next.js route) and
     // redirects the buyer to the hosted payment page. Confirmation happens
     // in POST /orders/:id/confirm once Stripe redirects back to /success.
-    res.json({ orderId: order._id.toString(), status: "pending" });
+    // Prices below are the authoritative, server-computed ones — the client
+    // must build the Stripe session from this response, not from local state.
+    res.json({
+      orderId: order._id.toString(),
+      status: "pending",
+      totalAmount,
+      items: items.map((i) => ({ title: i.title, image: i.image, price: i.price, quantity: i.quantity })),
+    });
   }),
 );
 
@@ -595,9 +659,19 @@ app.post(
     if (order.buyer._id.toString() !== user._id.toString()) {
       return res.status(403).json({ message: "Not your order" });
     }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ message: "Order was cancelled" });
+    }
+    if (order.paymentStatus === "paid") {
+      return res.json({ order: toOrder(order) });
+    }
 
     const sessionId = String((req.body ?? {}).sessionId ?? "");
-    if (stripe && sessionId) {
+
+    if (stripe) {
+      if (!sessionId) {
+        return res.status(400).json({ message: "Payment session is required" });
+      }
       const session = await stripe.checkout.sessions.retrieve(sessionId);
       if (session.payment_status !== "paid") {
         return res.status(400).json({ message: `Payment not completed (${session.payment_status})` });
@@ -605,20 +679,43 @@ app.post(
       if (session.metadata?.orderId !== order._id.toString()) {
         return res.status(400).json({ message: "Session does not match this order" });
       }
+      if (session.amount_total != null && session.amount_total !== Math.round(order.totalAmount * 100)) {
+        return res.status(400).json({ message: "Payment amount does not match order total" });
+      }
+
+      const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : undefined;
       await orders().updateOne(
         { _id: order._id },
-        { $set: { paymentStatus: "paid", status: "processing", orderStatus: "processing" } },
+        {
+          $set: {
+            paymentStatus: "paid",
+            status: "processing",
+            orderStatus: "processing",
+            ...(paymentIntentId ? { paymentIntentId } : {}),
+          },
+        },
       );
+      await adjustStock(order, -1);
       return res.json({
-        order: toOrder({ ...order, paymentStatus: "paid", status: "processing", orderStatus: "processing" }),
+        order: toOrder({
+          ...order,
+          paymentStatus: "paid",
+          status: "processing",
+          orderStatus: "processing",
+          paymentIntentId,
+        }),
       });
     }
 
-    // Dev fallback (no STRIPE_SECRET_KEY) — confirm without verification.
+    // Keyless dev fallback — only when explicitly enabled.
+    if (!ALLOW_DEV_PAYMENT_FALLBACK) {
+      return res.status(400).json({ message: "Payment verification is unavailable" });
+    }
     await orders().updateOne(
       { _id: order._id },
       { $set: { paymentStatus: "paid", status: "processing", orderStatus: "processing" } },
     );
+    await adjustStock(order, -1);
     res.json({
       order: toOrder({ ...order, paymentStatus: "paid", status: "processing", orderStatus: "processing" }),
     });
@@ -652,11 +749,34 @@ app.post(
     if (order.buyer._id.toString() !== user._id.toString()) {
       return res.status(403).json({ message: "Not your order" });
     }
+    if (order.status === "cancelled") {
+      return res.json({ order: toOrder(order) });
+    }
+
+    let paymentStatus = order.paymentStatus;
+    if (order.paymentStatus === "paid") {
+      if (stripe && order.paymentIntentId) {
+        try {
+          await stripe.refunds.create({ payment_intent: order.paymentIntentId });
+        } catch (e) {
+          return res.status(502).json({
+            message: e instanceof Error ? `Refund failed: ${e.message}` : "Refund failed",
+          });
+        }
+        paymentStatus = "refunded";
+      } else {
+        paymentStatus = "refunded"; // keyless dev fallback — no live refund issued
+      }
+    }
+
     await orders().updateOne(
       { _id: order._id },
-      { $set: { status: "cancelled", orderStatus: "cancelled", paymentStatus: "refunded" } },
+      { $set: { status: "cancelled", orderStatus: "cancelled", paymentStatus } },
     );
-    res.json({ order: toOrder({ ...order, status: "cancelled", orderStatus: "cancelled", paymentStatus: "refunded" }) });
+    await adjustStock(order, 1);
+    res.json({
+      order: toOrder({ ...order, status: "cancelled", orderStatus: "cancelled", paymentStatus }),
+    });
   }),
 );
 
@@ -695,7 +815,14 @@ app.get(
     const myOrderDocs = await orders()
       .find({ status: { $ne: "cancelled" }, "items.seller._id": sellerId } as Filter<OrderDoc>)
       .toArray();
-    const revenue = myOrderDocs.reduce((s, o) => s + o.totalAmount, 0);
+    const revenue = myOrderDocs.reduce(
+      (s, o) =>
+        s +
+        o.items
+          .filter((i) => i.seller._id === sellerId)
+          .reduce((a, i) => a + i.price * i.quantity, 0),
+      0,
+    );
     const pids = myProducts.map((p) => p._id.toString());
     const allReviews = pids.length ? await reviews().find({ productId: { $in: pids } }).toArray() : [];
     const avgRating = allReviews.length
@@ -770,16 +897,19 @@ app.post(
   ah(async (req, res) => {
     const user = await apiUser(req, res);
     if (!user) return res.status(401).json({ message: "Not authenticated" });
-    const body = (req.body ?? {}) as Partial<ProductPayload>;
+    const parsed = productSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: parsed.error.issues[0]?.message ?? "Invalid product" });
+    }
     const doc: ProductDoc = {
       _id: new ObjectId(),
-      title: String(body.title ?? "").trim(),
-      description: body.description,
-      price: Number(body.price) || 0,
-      discountPrice: body.discountPrice != null ? Number(body.discountPrice) : null,
-      category: body.category,
-      stock: Number(body.stock) || 0,
-      images: body.images ?? [],
+      title: parsed.data.title,
+      description: parsed.data.description,
+      price: parsed.data.price,
+      discountPrice: parsed.data.discountPrice ?? null,
+      category: parsed.data.category,
+      stock: parsed.data.stock,
+      images: parsed.data.images ?? [],
       sellerId: user._id.toString(),
       sellerName: user.name,
       createdAt: new Date(),
@@ -797,15 +927,18 @@ app.patch(
     const oid = toOid(req.params.id);
     const existing = oid ? await products().findOne({ _id: oid }) : null;
     if (!existing) return res.status(404).json({ message: "Product not found" });
-    const body = (req.body ?? {}) as Partial<ProductPayload>;
+    const parsed = productPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: parsed.error.issues[0]?.message ?? "Invalid product" });
+    }
     const patch: Partial<ProductDoc> = {};
-    if (body.title != null) patch.title = String(body.title).trim();
-    if (body.description != null) patch.description = body.description;
-    if (body.price != null) patch.price = Number(body.price);
-    if (body.discountPrice != null) patch.discountPrice = Number(body.discountPrice);
-    if (body.category != null) patch.category = body.category;
-    if (body.stock != null) patch.stock = Number(body.stock);
-    if (body.images != null) patch.images = body.images;
+    if (parsed.data.title != null) patch.title = parsed.data.title;
+    if (parsed.data.description != null) patch.description = parsed.data.description;
+    if (parsed.data.price != null) patch.price = parsed.data.price;
+    if (parsed.data.discountPrice != null) patch.discountPrice = parsed.data.discountPrice;
+    if (parsed.data.category != null) patch.category = parsed.data.category;
+    if (parsed.data.stock != null) patch.stock = parsed.data.stock;
+    if (parsed.data.images != null) patch.images = parsed.data.images;
     await products().updateOne({ _id: existing._id }, { $set: patch });
     const updated = await products().findOne({ _id: existing._id });
     res.json({ product: updated ? await enrichProduct(updated) : null });
@@ -855,10 +988,20 @@ app.patch(
   "/api/seller/orders/:id/status",
   requireRoles("seller", "admin"),
   ah(async (req, res) => {
+    const user = await apiUser(req, res);
+    if (!user) return res.status(401).json({ message: "Not authenticated" });
     const oid = toOid(req.params.id);
     const order = oid ? await orders().findOne({ _id: oid }) : null;
     if (!order) return res.status(404).json({ message: "Order not found" });
-    const status = String((req.body ?? {}).status ?? "");
+    const ownsItem =
+      user.role === "admin" || order.items.some((i) => i.seller._id === user._id.toString());
+    if (!ownsItem) return res.status(403).json({ message: "Order has no items from your shop" });
+
+    const parsed = statusSchema.safeParse((req.body ?? {}).status);
+    if (!parsed.success) {
+      return res.status(400).json({ message: `Status must be one of: ${ORDER_STATUSES.join(", ")}` });
+    }
+    const status = parsed.data;
     await orders().updateOne(
       { _id: order._id },
       { $set: { status, orderStatus: status } },
@@ -922,7 +1065,11 @@ app.patch(
   "/api/admin/users/:id/role",
   requireRoles("admin"),
   ah(async (req, res) => {
-    const role = String((req.body ?? {}).role ?? "");
+    const parsed = roleSchema.safeParse((req.body ?? {}).role);
+    if (!parsed.success) {
+      return res.status(400).json({ message: `Role must be one of: ${ROLES.join(", ")}` });
+    }
+    const role = parsed.data;
     const oid = toOid(req.params.id);
     const user = oid ? await users().findOne({ _id: oid }) : null;
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -948,11 +1095,26 @@ app.delete(
   "/api/admin/users/:id",
   requireRoles("admin"),
   ah(async (req, res) => {
+    const admin = await apiUser(req, res);
+    if (!admin) return res.status(401).json({ message: "Not authenticated" });
     const oid = toOid(req.params.id);
     const user = oid ? await users().findOne({ _id: oid }) : null;
     if (!user) return res.status(404).json({ message: "User not found" });
+    if (user._id.equals(admin._id)) {
+      return res.status(400).json({ message: "You cannot delete your own account" });
+    }
+    const userId = req.params.id;
     await users().deleteOne({ _id: user._id });
-    await wishlists().deleteMany({ userId: req.params.id });
+    await wishlists().deleteMany({ userId });
+    await sessions().deleteMany({ userId: user._id });
+    await reviews().deleteMany({ userId });
+    const theirProducts = await products().find({ sellerId: userId }).toArray();
+    const productIds = theirProducts.map((p) => p._id.toString());
+    await products().deleteMany({ sellerId: userId });
+    if (productIds.length) {
+      await reviews().deleteMany({ productId: { $in: productIds } });
+      await wishlists().updateMany({}, { $pull: { productIds: { $in: productIds } } });
+    }
     res.json({ success: true });
   }),
 );
@@ -1038,7 +1200,11 @@ app.patch(
     const oid = toOid(req.params.id);
     const order = oid ? await orders().findOne({ _id: oid }) : null;
     if (!order) return res.status(404).json({ message: "Order not found" });
-    const status = String((req.body ?? {}).status ?? "");
+    const parsed = statusSchema.safeParse((req.body ?? {}).status);
+    if (!parsed.success) {
+      return res.status(400).json({ message: `Status must be one of: ${ORDER_STATUSES.join(", ")}` });
+    }
+    const status = parsed.data;
     await orders().updateOne({ _id: order._id }, { $set: { status, orderStatus: status } });
     res.json({ order: toOrder({ ...order, status, orderStatus: status }) });
   }),
