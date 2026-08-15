@@ -26,17 +26,32 @@ app.use(express.json());
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 100,
+  limit: 300,
+  message: {
+    message: "Too many requests. Please try again in a few minutes.",
+  },
   standardHeaders: true,
   legacyHeaders: false,
 });
-const strictLimiter = rateLimit({
+const checkoutLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  message: {
+    message: "Too many requests. Please try again in a few minutes.",
+  },
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use(globalLimiter);
+
+app.use(async (_req: Request, _res: Response, next: NextFunction) => {
+  try {
+    await ensureStarted();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 const client = new MongoClient(MONGODB_URI, {
   serverApi: {
@@ -512,7 +527,7 @@ app.delete(
 
 app.post(
   "/api/orders/checkout",
-  strictLimiter,
+  checkoutLimiter,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = await apiUser(req, res);
@@ -935,7 +950,7 @@ app.get(
       const items = [];
       for (const p of docs) {
         const enriched = await enrichProduct(p);
-        items.push({ ...enriched, sold: p.sold ?? 0 });
+        items.push({ ...enriched, sold: p.sold ?? 0, hidden: !!p.hidden });
       }
       res.json({ items });
     } catch (err) {
@@ -1245,6 +1260,27 @@ app.delete(
     }
   });
 
+app.patch(
+  "/api/seller/products/:id/visibility",
+  requireRoles("seller", "admin"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = await apiUser(req, res);
+      if (!user) return res.status(401).json({ message: "Not authenticated" });
+      const oid = (ObjectId.isValid(req.params.id) ? new ObjectId(req.params.id) : null);
+      const product = oid ? await products().findOne({ _id: oid }) : null;
+      if (!product) return res.status(404).json({ message: "Product not found" });
+      if (user.role !== "admin" && product.sellerId !== user._id.toString()) {
+        return res.status(403).json({ message: "This product doesn't belong to your shop" });
+      }
+      const hidden = !!(req.body ?? {}).hidden;
+      await products().updateOne({ _id: product._id }, { $set: { hidden } });
+      res.json({ product: await enrichProduct({ ...product, hidden }) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
 app.get(
   "/api/seller/orders",
   requireRoles("seller", "admin"),
@@ -1276,7 +1312,7 @@ app.get(
 
 app.patch(
   "/api/seller/orders/:id/status",
-  requireRoles("seller", "admin"),
+  requireRoles("seller"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = await apiUser(req, res);
@@ -1284,8 +1320,7 @@ app.patch(
       const oid = (ObjectId.isValid(req.params.id) ? new ObjectId(req.params.id) : null);
       const order = oid ? await orders().findOne({ _id: oid }) : null;
       if (!order) return res.status(404).json({ message: "Order not found" });
-      const ownsItem =
-        user.role === "admin" || order.items.some((i) => i.seller._id === user._id.toString());
+      const ownsItem = order.items.some((i) => i.seller._id === user._id.toString());
       if (!ownsItem) return res.status(403).json({ message: "Order has no items from your shop" });
 
       const currentStatus = (req.body ?? {}).status;
@@ -1526,35 +1561,6 @@ app.get(
     }
   });
 
-app.patch(
-  "/api/admin/orders/:id/status",
-  requireRoles("admin"),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const oid = (ObjectId.isValid(req.params.id) ? new ObjectId(req.params.id) : null);
-      const order = oid ? await orders().findOne({ _id: oid }) : null;
-      if (!order) return res.status(404).json({ message: "Order not found" });
-      const currentStatus = (req.body ?? {}).status;
-      if (
-        typeof currentStatus !== "string" ||
-        !(ORDER_STATUSES as readonly string[]).includes(currentStatus)
-      ) {
-        return res.status(400).json({
-          message: `Status must be one of: ${ORDER_STATUSES.join(", ")}`,
-        });
-      }
-      await orders().updateOne(
-        { _id: order._id },
-        { $set: { status: currentStatus, orderStatus: currentStatus } },
-      );
-      res.json({
-        order: toOrder({ ...order, status: currentStatus, orderStatus: currentStatus }),
-      });
-    } catch (err) {
-      next(err);
-    }
-  });
-
 // ------------------------------------------------------------
 // Fallback + error handling
 // ------------------------------------------------------------
@@ -1567,6 +1573,15 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err);
   res.status(500).json({ message: err instanceof Error ? err.message : "Internal server error" });
 });
+
+let startedPromise: Promise<void> | null = null;
+
+function ensureStarted(): Promise<void> {
+  if (!startedPromise) {
+    startedPromise = start();
+  }
+  return startedPromise;
+}
 
 async function start() {
   await client.connect();
@@ -1587,12 +1602,18 @@ async function start() {
     })
     .catch((e) => console.error("Session cleanup failed:", e));
 
-  app.listen(PORT, () => {
-    console.log(`API running on http://localhost:${PORT} (db: ${DB_NAME})`);
+  if (process.env.VERCEL !== "1") {
+    app.listen(PORT, () => {
+      console.log(`API running on http://localhost:${PORT} (db: ${DB_NAME})`);
+    });
+  }
+}
+
+if (process.env.VERCEL !== "1") {
+  ensureStarted().catch((err) => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
   });
 }
 
-start().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+export default app;
