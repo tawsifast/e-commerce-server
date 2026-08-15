@@ -359,11 +359,23 @@ app.get(
         .find({ hidden: { $ne: true }, category: { $exists: true, $ne: "" } } as Filter<ProductDoc>)
         .toArray();
       const counts = new Map<string, number>();
+      const cover = new Map<string, string>();
+      const sold = new Map<string, number>();
       for (const p of docs) {
         if (!p.category) continue;
-        counts.set(p.category, (counts.get(p.category) ?? 0) + 1);
+        const cat = p.category;
+        counts.set(cat, (counts.get(cat) ?? 0) + 1);
+        const pSold = p.sold ?? 0;
+        if (p.images?.[0] && (sold.get(cat) ?? -1) < pSold) {
+          sold.set(cat, pSold);
+          cover.set(cat, p.images[0]);
+        }
       }
-      res.json({ items: [...counts.entries()].map(([name, count]) => ({ name, count })) });
+      res.json({
+        items: [...counts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([name, count]) => ({ name, count, image: cover.get(name) })),
+      });
     } catch (err) {
       next(err);
     }
