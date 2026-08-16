@@ -155,6 +155,15 @@ const orders = (): Collection<OrderDoc> => db.collection<OrderDoc>("orders");
 const wishlists = (): Collection<WishlistDoc> => db.collection<WishlistDoc>("wishlists");
 const users = (): Collection<MongoUser> => db.collection<MongoUser>("user");
 
+// ---- TTL in-memory cache for the categories list (~60 s) ----
+let categoriesCache: { data: unknown; expires: number } | null = null;
+function invalidateCategoriesCache() { categoriesCache = null; }
+
+// ---- Escape a string for safe use inside a MongoDB $regex ----
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
@@ -272,60 +281,140 @@ app.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const q = req.query;
-      const search = String(q.search ?? "").trim().toLowerCase();
+      const search = String(q.search ?? "").trim();
       const category = typeof q.category === "string" && q.category ? q.category : undefined;
-      const brand = typeof q.brand === "string" ? q.brand.trim().toLowerCase() : undefined;
+      const brand = typeof q.brand === "string" && q.brand.trim() ? q.brand.trim() : undefined;
       const minPrice = q.minPrice != null && !Number.isNaN(Number(q.minPrice)) ? Number(q.minPrice) : undefined;
       const maxPrice = q.maxPrice != null && !Number.isNaN(Number(q.maxPrice)) ? Number(q.maxPrice) : undefined;
       const sort = String(q.sort ?? "newest");
       const { page, limit } = pageOf(req, 12);
+      const skip = (page - 1) * limit;
 
-      const priceOf = (p: ProductDoc) => p.discountPrice ?? p.price;
-
-      let items = (await products().find({ hidden: { $ne: true } }).toArray()).filter((p) => {
-        const finalPrice = priceOf(p);
-        if (category && p.category !== category) return false;
-        if (brand && !p.brand?.toLowerCase().includes(brand)) return false;
-        if (minPrice != null && finalPrice < minPrice) return false;
-        if (maxPrice != null && finalPrice > maxPrice) return false;
-        if (search) {
-          const haystack = `${p.title} ${p.brand ?? ""} ${p.category ?? ""}`.toLowerCase();
-          if (!haystack.includes(search)) return false;
-        }
-        return true;
-      });
-
-      switch (sort) {
-        case "price-asc":
-          items = [...items].sort((a, b) => priceOf(a) - priceOf(b));
-          break;
-        case "price-desc":
-          items = [...items].sort((a, b) => priceOf(b) - priceOf(a));
-          break;
-        case "rating": {
-          const sums = new Map<string, number>();
-          const counts = new Map<string, number>();
-          const grouped = await reviews()
-            .find({ productId: { $in: items.map((p) => p._id.toString()) } })
-            .toArray();
-          for (const r of grouped) {
-            sums.set(r.productId, (sums.get(r.productId) ?? 0) + r.rating);
-            counts.set(r.productId, (counts.get(r.productId) ?? 0) + 1);
-          }
-          items = [...items].sort((a, b) => {
-            const avgA = (sums.get(a._id.toString()) ?? 0) / (counts.get(a._id.toString()) ?? 1);
-            const avgB = (sums.get(b._id.toString()) ?? 0) / (counts.get(b._id.toString()) ?? 1);
-            return avgB - avgA || (counts.get(b._id.toString()) ?? 0) - (counts.get(a._id.toString()) ?? 0);
-          });
-          break;
-        }
-        default:
-          items = [...items].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      // Build MongoDB filter — push all filtering to DB (replaces JS .filter())
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const matchStage: Record<string, any> = { hidden: { $ne: true } };
+      if (category) matchStage.category = category;
+      if (brand) matchStage.brand = { $regex: escapeRegex(brand), $options: "i" };
+      if (search) {
+        matchStage.$or = [
+          { title: { $regex: escapeRegex(search), $options: "i" } },
+          { brand: { $regex: escapeRegex(search), $options: "i" } },
+          { category: { $regex: escapeRegex(search), $options: "i" } },
+        ];
+      }
+      if (minPrice != null || maxPrice != null) {
+        const priceExpr = { $ifNull: ["$discountPrice", "$price"] };
+        const priceConds = [];
+        if (minPrice != null) priceConds.push({ $gte: [priceExpr, minPrice] });
+        if (maxPrice != null) priceConds.push({ $lte: [priceExpr, maxPrice] });
+        matchStage.$expr = priceConds.length === 1 ? priceConds[0] : { $and: priceConds };
       }
 
-      const enriched = [];
-      for (const p of items) enriched.push(await enrichProduct(p));
-      res.json(await paginate(enriched, page, limit));
+      let pageItems: WithId<ProductDoc>[];
+      let total: number;
+
+      if (sort === "rating") {
+        // Fetch all matching IDs (projection only), then batch-query reviews for rating sort
+        const allDocs = await products()
+          .find(matchStage as Filter<ProductDoc>, { projection: { _id: 1 } })
+          .toArray();
+        total = allDocs.length;
+        const allIds = allDocs.map((d) => d._id.toString());
+
+        // Single batched reviews query for all matching products
+        const allRevs = total
+          ? await reviews()
+              .find({ productId: { $in: allIds } }, { projection: { productId: 1, rating: 1, _id: 0 } })
+              .toArray()
+          : [];
+        const sums = new Map<string, number>();
+        const counts = new Map<string, number>();
+        for (const r of allRevs) {
+          sums.set(r.productId, (sums.get(r.productId) ?? 0) + r.rating);
+          counts.set(r.productId, (counts.get(r.productId) ?? 0) + 1);
+        }
+
+        // Sort IDs by rating in JS, then slice the page
+        const sortedIds = [...allIds].sort((a, b) => {
+          const avgA = counts.get(a) ? (sums.get(a) ?? 0) / counts.get(a)! : 0;
+          const avgB = counts.get(b) ? (sums.get(b) ?? 0) / counts.get(b)! : 0;
+          return avgB - avgA || (counts.get(b) ?? 0) - (counts.get(a) ?? 0);
+        });
+
+        const pageObjectIds = sortedIds
+          .slice(skip, skip + limit)
+          .map((id) => new ObjectId(id));
+
+        if (pageObjectIds.length) {
+          const pageDocs = await products().find({ _id: { $in: pageObjectIds } }).toArray();
+          const byId = new Map(pageDocs.map((p) => [p._id.toString(), p]));
+          pageItems = pageObjectIds
+            .map((id) => byId.get(id.toString()))
+            .filter((p): p is WithId<ProductDoc> => p != null);
+        } else {
+          pageItems = [];
+        }
+      } else if (sort === "price-asc" || sort === "price-desc") {
+        // Aggregation pipeline to sort by computed effectivePrice field
+        const dir = sort === "price-asc" ? 1 : -1;
+        [pageItems, total] = await Promise.all([
+          products().aggregate<WithId<ProductDoc>>([
+            { $match: matchStage },
+            { $addFields: { _effectivePrice: { $ifNull: ["$discountPrice", "$price"] } } },
+            { $sort: { _effectivePrice: dir } },
+            { $skip: skip },
+            { $limit: limit },
+          ]).toArray(),
+          products().countDocuments(matchStage as Filter<ProductDoc>),
+        ]);
+      } else {
+        // newest — simple indexed sort pushed to DB
+        [pageItems, total] = await Promise.all([
+          products()
+            .find(matchStage as Filter<ProductDoc>)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+          products().countDocuments(matchStage as Filter<ProductDoc>),
+        ]);
+      }
+
+      // Single batched reviews query for only the page items — kills the N+1
+      const pageIds = pageItems.map((p) => p._id.toString());
+      const pageRevs = pageIds.length
+        ? await reviews().find({ productId: { $in: pageIds } }).toArray()
+        : [];
+      const revSums = new Map<string, number>();
+      const revCounts = new Map<string, number>();
+      for (const r of pageRevs) {
+        revSums.set(r.productId, (revSums.get(r.productId) ?? 0) + r.rating);
+        revCounts.set(r.productId, (revCounts.get(r.productId) ?? 0) + 1);
+      }
+
+      const enrichedItems = pageItems.map((p) => {
+        const id = p._id.toString();
+        const cnt = revCounts.get(id) ?? 0;
+        return {
+          _id: id,
+          title: p.title,
+          brand: p.brand,
+          category: p.category ?? undefined,
+          price: p.price,
+          discountPrice: p.discountPrice ?? null,
+          stock: p.stock,
+          images: p.images ?? [],
+          description: p.description ?? undefined,
+          specifications: p.specifications,
+          createdAt: iso(p.createdAt),
+          averageRating: cnt ? (revSums.get(id) ?? 0) / cnt : 0,
+          reviewCount: cnt,
+          seller: { _id: p.sellerId, name: p.sellerName },
+        };
+      });
+
+      const pages = Math.max(1, Math.ceil(total / limit));
+      res.json({ items: enrichedItems, total, page, pages });
     } catch (err) {
       next(err);
     }
@@ -366,6 +455,11 @@ app.get(
   "/api/products/categories",
   async (_req: Request, res: Response, next: NextFunction) => {
     try {
+      // Serve from 60-second TTL cache to avoid rescanning the collection on every filter change
+      if (categoriesCache && Date.now() < categoriesCache.expires) {
+        return res.json(categoriesCache.data);
+      }
+
       const docs = await products()
         .find({ hidden: { $ne: true }, category: { $exists: true, $ne: "" } } as Filter<ProductDoc>)
         .toArray();
@@ -382,11 +476,13 @@ app.get(
           cover.set(cat, p.images[0]);
         }
       }
-      res.json({
+      const data = {
         items: [...counts.entries()]
           .sort((a, b) => b[1] - a[1])
           .map(([name, count]) => ({ name, count, image: cover.get(name) })),
-      });
+      };
+      categoriesCache = { data, expires: Date.now() + 60_000 };
+      res.json(data);
     } catch (err) {
       next(err);
     }
@@ -1172,6 +1268,7 @@ app.post(
         sold: 0,
       };
       await products().insertOne(doc);
+      invalidateCategoriesCache();
       res.json({ product: await enrichProduct(doc) });
     } catch (err) {
       next(err);
@@ -1328,6 +1425,7 @@ app.patch(
       }
 
       await products().updateOne({ _id: existing._id }, { $set: updatedFields });
+      invalidateCategoriesCache();
       const updated = await products().findOne({ _id: existing._id });
       res.json({ product: updated ? await enrichProduct(updated) : null });
     } catch (err) {
@@ -1343,6 +1441,7 @@ app.delete(
       const oid = (ObjectId.isValid(req.params.id) ? new ObjectId(req.params.id) : null);
       if (!oid) return res.status(404).json({ message: "Product not found" });
       await products().deleteOne({ _id: oid });
+      invalidateCategoriesCache();
       await reviews().deleteMany({ productId: req.params.id });
       await wishlists().updateMany({}, { $pull: { productIds: req.params.id } });
       res.json({ success: true });
@@ -1366,6 +1465,7 @@ app.patch(
       }
       const hidden = !!(req.body ?? {}).hidden;
       await products().updateOne({ _id: product._id }, { $set: { hidden } });
+      invalidateCategoriesCache();
       res.json({ product: await enrichProduct({ ...product, hidden }) });
     } catch (err) {
       next(err);
@@ -1604,6 +1704,7 @@ app.patch(
       const product = oid ? await products().findOne({ _id: oid }) : null;
       if (!product) return res.status(404).json({ message: "Product not found" });
       await products().updateOne({ _id: product._id }, { $set: { hidden } });
+      invalidateCategoriesCache();
       res.json({ product: await enrichProduct({ ...product, hidden }) });
     } catch (err) {
       next(err);
@@ -1618,6 +1719,7 @@ app.delete(
       const oid = (ObjectId.isValid(req.params.id) ? new ObjectId(req.params.id) : null);
       if (!oid) return res.status(404).json({ message: "Product not found" });
       await products().deleteOne({ _id: oid });
+      invalidateCategoriesCache();
       await reviews().deleteMany({ productId: req.params.id });
       await wishlists().updateMany({}, { $pull: { productIds: req.params.id } });
       res.json({ success: true });
@@ -1677,6 +1779,15 @@ function ensureStarted(): Promise<void> {
 async function start() {
   await client.connect();
   db = client.db(DB_NAME);
+
+  // Ensure compound indexes for fast filtered product queries
+  await Promise.all([
+    products().createIndex({ hidden: 1, category: 1 }),
+    products().createIndex({ hidden: 1, brand: 1 }),
+    products().createIndex({ hidden: 1, createdAt: -1 }),
+    products().createIndex({ hidden: 1, sold: -1 }),
+    reviews().createIndex({ productId: 1 }),
+  ]).catch((e) => console.warn("Index creation warning:", e));
 
   // Clean up sessions whose user no longer exists (deleted accounts).
   // Note: both user _id and session userId are ObjectIds in the DB.
