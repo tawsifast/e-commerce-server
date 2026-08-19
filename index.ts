@@ -1018,7 +1018,7 @@ app.get(
           Authorization: `Bearer ${GROQ_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
+          model: process.env.GROQ_MODEL ?? "openai/gpt-oss-20b",
           messages: [
             {
               role: "system",
@@ -1034,7 +1034,7 @@ app.get(
       if (!groqRes.ok) {
         const errText = await groqRes.text();
         console.error("Groq error:", errText);
-        return res.status(502).json({ message: "Chat service unavailable" });
+        return res.status(502).json({ message: `Chat service unavailable: ${errText.slice(0, 200) || `Groq responded with ${groqRes.status}`}` });
       }
 
       const data = await groqRes.json();
