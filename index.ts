@@ -231,6 +231,41 @@ async function enrichProduct(p: WithId<ProductDoc>) {
   };
 }
 
+// Batched equivalent of enrichProduct for multiple products — kills the N+1
+// reviews query by fetching all reviews for the passed product IDs in one pass.
+async function enrichProducts(pdocs: WithId<ProductDoc>[]) {
+  const ids = pdocs.map((p) => p._id.toString());
+  const revs = ids.length
+    ? await reviews().find({ productId: { $in: ids } }).toArray()
+    : [];
+  const revSums = new Map<string, number>();
+  const revCounts = new Map<string, number>();
+  for (const r of revs) {
+    revSums.set(r.productId, (revSums.get(r.productId) ?? 0) + r.rating);
+    revCounts.set(r.productId, (revCounts.get(r.productId) ?? 0) + 1);
+  }
+  return pdocs.map((p) => {
+    const id = p._id.toString();
+    const cnt = revCounts.get(id) ?? 0;
+    return {
+      _id: id,
+      title: p.title,
+      brand: p.brand,
+      category: p.category ?? undefined,
+      price: p.price,
+      discountPrice: p.discountPrice ?? null,
+      stock: p.stock,
+      images: p.images ?? [],
+      description: p.description ?? undefined,
+      specifications: p.specifications,
+      createdAt: iso(p.createdAt),
+      averageRating: cnt ? (revSums.get(id) ?? 0) / cnt : 0,
+      reviewCount: cnt,
+      seller: { _id: p.sellerId, name: p.sellerName },
+    };
+  });
+}
+
 async function paginate<T>(items: T[], page: number, limit: number) {
   const total = items.length;
   const pages = Math.max(1, Math.ceil(total / limit));
@@ -425,8 +460,7 @@ app.get(
   async (_req: Request, res: Response, next: NextFunction) => {
     try {
       const docs = await products().find({ hidden: { $ne: true }, featured: true }).toArray();
-      const items = [];
-      for (const p of docs) items.push(await enrichProduct(p));
+      const items = await enrichProducts(docs);
       items.sort((a, b) => (b.averageRating ?? 0) - (a.averageRating ?? 0));
       res.json({ items });
     } catch (err) {
@@ -443,8 +477,7 @@ app.get(
         .sort({ sold: -1 })
         .limit(8)
         .toArray();
-      const items = [];
-      for (const p of docs) items.push(await enrichProduct(p));
+      const items = await enrichProducts(docs);
       res.json({ items });
     } catch (err) {
       next(err);
